@@ -1,10 +1,10 @@
-from flask import Flask, render_template, request, send_file, redirect, url_for
+from flask import Flask, render_template, request, send_file, redirect, url_for, after_this_request
 import pandas as pd
 import os
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['UPLOAD_FOLDER'] = '/tmp' if os.environ.get('RENDER') else 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 
 ALLOWED_EXTENSIONS = {'xlsx', 'xls'}
@@ -53,8 +53,31 @@ def upload_files():
     # Compare files
     try:
         result_file = compare_excel_files(aims_path, tajneed_path)
+
+        # Delete uploaded files immediately after comparison
+        try:
+            os.remove(aims_path)
+            os.remove(tajneed_path)
+        except Exception:
+            pass
+
+        @after_this_request
+        def cleanup(response):
+            try:
+                os.remove(result_file)
+            except Exception:
+                pass
+            return response
+
         return send_file(result_file, as_attachment=True, download_name='Unterschiede_AIMS_Tajneed.xlsx')
     except Exception as e:
+        try:
+            if os.path.exists(aims_path):
+                os.remove(aims_path)
+            if os.path.exists(tajneed_path):
+                os.remove(tajneed_path)
+        except Exception:
+            pass
         return redirect(url_for('index', error=str(e)))
 
 def compare_excel_files(aims_path, tajneed_path):
@@ -69,10 +92,6 @@ def compare_excel_files(aims_path, tajneed_path):
     
     # Combine all AIMS sheets
     aims_df = pd.concat(aims_dfs, ignore_index=True)
-    
-    # Filter out rows where MBRTZMCDE = 'B' (ignore these)
-    if 'MBRTZMCDE' in aims_df.columns:
-        aims_df = aims_df[aims_df['MBRTZMCDE'] != 'B']
     
     # Read Tajneed Excel file
     tajneed_df = pd.read_excel(tajneed_path)
@@ -106,12 +125,30 @@ def compare_excel_files(aims_path, tajneed_path):
     # Filter rows with missing IDs
     missing_rows = aims_df[aims_df[aims_id_col].astype(str).isin(missing_ids)]
     
-    # Save result
+    # Save result - split by Majlis (original AIMS sheet names) into sheets
     result_path = os.path.join(app.config['UPLOAD_FOLDER'], 'Unterschiede_AIMS_Tajneed.xlsx')
-    missing_rows.to_excel(result_path, index=False)
-    
+
+    def clean_sheet_name(name):
+        # Remove invalid Excel characters: \ / * ? : [ ]
+        invalid = r'\/*?:[]'
+        for ch in invalid:
+            name = name.replace(ch, '')
+        return name.strip()[:31] or 'Sheet'
+
+    with pd.ExcelWriter(result_path, engine='openpyxl') as writer:
+        # First sheet: all missing rows combined
+        missing_rows.to_excel(writer, sheet_name='Alle', index=False)
+
+        # Then one sheet per Majlis
+        if 'Majlis' in missing_rows.columns:
+            for majlis in missing_rows['Majlis'].dropna().unique():
+                group = missing_rows[missing_rows['Majlis'] == majlis]
+                if len(group) > 0:
+                    sheet_name = clean_sheet_name(str(majlis))
+                    group.to_excel(writer, sheet_name=sheet_name, index=False)
+
     return result_path
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('PORT', 5001))
     app.run(host='0.0.0.0', port=port, debug=False)
